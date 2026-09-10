@@ -205,6 +205,18 @@ function serialize (cmpts, opts) {
   return uriTokens.join('')
 }
 
+/**
+ * Whether the host is a bracketed IP literal (RFC 3986 `IP-literal`).
+ * An unterminated `[` is not a literal, so it must still be validated as a
+ * reg-name instead of being waved through as an IP.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isIPLiteral (host) {
+  return host[0] === '[' && host[host.length - 1] === ']'
+}
+
 const URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u
 
 // Captures the authority component (between "//" and the next "/", "?" or "#"),
@@ -256,6 +268,7 @@ function parseWithStatus (uri, opts) {
   }
 
   let malformedAuthorityOrPort = false
+  let malformedIPLiteral = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -327,9 +340,19 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
         const ipv6result = normalizeIPv6(parsed.host)
-        parsed.host = ipv6result.host.toLowerCase()
-        isIP = ipv6result.isIPV6
+        isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
+        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
+
+        // A bracketed IP literal that is not a valid IPv6 / IPvFuture address
+        // has no second reading: report it instead of handing back a rewritten
+        // host that resolves elsewhere than the one that was requested.
+        if (malformedIPLiteral) {
+          parsed.error = parsed.error || 'URI host is malformed.'
+          malformedAuthorityOrPort = true
+        }
       } else {
         isIP = true
       }
@@ -355,7 +378,7 @@ function parseWithStatus (uri, opts) {
     // check if scheme can't handle IRIs
     if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport)) {
       // if host component is a domain name
-      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && nonSimpleDomain(parsed.host)) {
+      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && !isIPLiteral(parsed.host) && isIP === false && nonSimpleDomain(parsed.host)) {
         // convert Unicode IDN -> ASCII IDN
         try {
           parsed.host = new URL('http://' + parsed.host).hostname
@@ -371,8 +394,12 @@ function parseWithStatus (uri, opts) {
         if (parsed.scheme !== undefined) {
           parsed.scheme = unescape(parsed.scheme)
         }
-        if (parsed.host !== undefined) {
-          parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
+        if (parsed.host !== undefined && !malformedIPLiteral) {
+          // An IP literal is already canonical: decoding it here would rewrite a
+          // zone identifier that legitimately carries escapes, and a malformed
+          // literal must be handed back exactly as it was given.
+          const host = isIP ? parsed.host : unescape(parsed.host)
+          parsed.host = reescapeHostDelimiters(host, isIP)
         }
       }
       if (parsed.path) {
