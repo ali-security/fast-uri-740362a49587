@@ -1,18 +1,13 @@
 name: CI
 
 on:
-  push:
-    branches:
-     - main
-     - next
-     - 'v*'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional space-separated list of test files to run instead of the full suite'
+        required: false
+        default: ''
+        type: string
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -26,6 +21,7 @@ jobs:
   test-regression-check-node10:
     name: Test compatibility with Node.js 10
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -40,6 +36,11 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin the registry to the release date
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2026-05-05T08:31:31.849000Z
+
       - name: Install
         run: |
           npm install --ignore-scripts
@@ -52,14 +53,20 @@ jobs:
           cp ./index.js ./node_modules/fast-uri/index.js
 
       - name: Run tests
+        shell: bash
         run: |
-          npm run test:unit
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx tape ${{ inputs.test-filter }}
+          else
+            npm run test:unit
+          fi
         env:
           NODE_OPTIONS: no-network-family-autoselection
 
   test-browser:
     name: Test browser compatibility
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +89,12 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin the registry to the release date
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2026-05-05T08:31:31.849000Z
+
       - name: Install dependencies
         run: |
           npm install --ignore-scripts
@@ -90,17 +103,72 @@ jobs:
         run: npx playwright install winldd
 
       - name: Run browser tests
+        shell: bash
         run: |
-          npm run test:browser:${{ matrix.browser }}
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx playwright-test ${{ inputs.test-filter }} --runner tape --browser=${{ matrix.browser }}
+          else
+            npm run test:browser:${{ matrix.browser }}
+          fi
 
   test:
+    name: Test
     needs:
       - test-regression-check-node10
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     permissions:
-      contents: write
-      pull-requests: write
-    uses: fastify/workflows/.github/workflows/plugins-ci.yml@v6
-    with:
-      license-check: true
-      lint: true
-      node-versions: '["16", "18", "20", "22", "24"]'
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['16', '18', '20', '22', '24']
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        exclude:
+          - os: macos-latest
+            node-version: '16'
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          check-latest: true
+          node-version: ${{ matrix.node-version }}
+
+      - name: Pin the registry to the release date
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2026-05-05T08:31:31.849000Z
+
+      - name: Install dependencies
+        run: npm i --ignore-scripts
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx tape ${{ inputs.test-filter }}
+          else
+            npm test
+          fi
+
+      - name: Pin npm to the version that packed the public tarball
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.node-version == '24' }}
+        run: npm i -g npm@11.13.0
+
+      - name: Pack the release tarball
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.node-version == '24' }}
+        run: npm pack
+
+      - name: Upload the release tarball
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.node-version == '24' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: fast-uri-*.tgz
+          if-no-files-found: error
